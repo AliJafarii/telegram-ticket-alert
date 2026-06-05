@@ -16,6 +16,8 @@ const CHECK_INTERVAL_MINUTES = Math.max(1, Number(process.env.CHECK_INTERVAL_MIN
 const SMART_DROP_PERCENT = Math.max(1, Number(process.env.SMART_DROP_PERCENT || 20));
 const SMART_MIN_HISTORY = Math.max(2, Number(process.env.SMART_MIN_HISTORY || 6));
 const NOTIFY_COOLDOWN_MINUTES = Math.max(5, Number(process.env.NOTIFY_COOLDOWN_MINUTES || 180));
+const MAX_ALERT_RANGE_DAYS = Math.max(1, Number(process.env.MAX_ALERT_RANGE_DAYS || 31));
+const DELETE_MESSAGES_AFTER_SECONDS = Math.max(0, Number(process.env.DELETE_MESSAGES_AFTER_SECONDS || 300));
 const transportLabels = {
   flight: 'هواپیما',
   train: 'قطار',
@@ -63,6 +65,30 @@ function addDays(date, days) {
   const d = new Date(date + 'T00:00:00Z');
   d.setUTCDate(d.getUTCDate() + days);
   return d.toISOString().slice(0, 10);
+}
+
+function daysBetween(startDate, endDate) {
+  const start = new Date(startDate + 'T00:00:00Z');
+  const end = new Date(endDate + 'T00:00:00Z');
+  if (Number.isNaN(start.getTime()) || Number.isNaN(end.getTime()) || end < start) return [];
+  const diff = Math.floor((end - start) / (24 * 60 * 60 * 1000)) + 1;
+  const count = Math.min(diff, MAX_ALERT_RANGE_DAYS);
+  return Array.from({ length: count }, (_, index) => {
+    const date = addDays(startDate, index);
+    return { date, jalaliDate: toJalali(date) };
+  });
+}
+
+async function sendManagedMessage(bot, chatId, text, extra) {
+  const sent = await bot.telegram.sendMessage(chatId, text, extra);
+  if (DELETE_MESSAGES_AFTER_SECONDS && sent?.message_id) {
+    setTimeout(() => {
+      bot.telegram.deleteMessage(chatId, sent.message_id).catch((error) => {
+        logger.warn('Could not delete message ' + sent.message_id + ' in chat ' + chatId + ': ' + error.message);
+      });
+    }, DELETE_MESSAGES_AFTER_SECONDS * 1000);
+  }
+  return sent;
 }
 
 async function fetchWeeklyTrend(alert, providers, firstDayLowest) {
@@ -317,14 +343,14 @@ async function sendAlertMessages(bot, alert, tickets, decision, errors) {
 
   if (msg.totalPages === 1) {
     const fullMsg = msg.header + '\n\n' + msg.pages[0] + msg.footer;
-    await bot.telegram.sendMessage(alert.chatId, fullMsg, { disable_web_page_preview: true });
+    await sendManagedMessage(bot, alert.chatId, fullMsg, { disable_web_page_preview: true });
   } else {
-    await bot.telegram.sendMessage(alert.chatId, msg.header, { disable_web_page_preview: true });
+    await sendManagedMessage(bot, alert.chatId, msg.header, { disable_web_page_preview: true });
     for (const page of msg.pages) {
-      await bot.telegram.sendMessage(alert.chatId, page, { disable_web_page_preview: true });
+      await sendManagedMessage(bot, alert.chatId, page, { disable_web_page_preview: true });
     }
     if (msg.footer) {
-      await bot.telegram.sendMessage(alert.chatId, msg.footer, { disable_web_page_preview: true });
+      await sendManagedMessage(bot, alert.chatId, msg.footer, { disable_web_page_preview: true });
     }
   }
 }
@@ -336,7 +362,7 @@ async function checkAlert(bot, alert, providers) {
   if (!activeProviders.length) {
     logger.warn(`Alert ${alert.id}: no enabled providers for ${alert.transport}`);
     if (shouldSendServiceMessage(alert, 'lastProviderWarningAt')) {
-      await bot.telegram.sendMessage(alert.chatId, buildNoProviderMessage(alert));
+      await sendManagedMessage(bot, alert.chatId, buildNoProviderMessage(alert));
       updateAlert(alert.id, { lastProviderWarningAt: new Date().toISOString() });
     }
     return;
@@ -353,7 +379,7 @@ async function checkAlert(bot, alert, providers) {
   if (!tickets.length) {
     logger.info(`Alert ${alert.id}: no tickets found`);
     if (shouldSendServiceMessage(alert, 'lastNoTicketWarningAt')) {
-      await bot.telegram.sendMessage(alert.chatId, buildNoTicketMessage(alert, errors), {
+      await sendManagedMessage(bot, alert.chatId, buildNoTicketMessage(alert, errors), {
         disable_web_page_preview: true
       });
       updateAlert(alert.id, { lastNoTicketWarningAt: new Date().toISOString() });
@@ -382,7 +408,7 @@ async function checkAlert(bot, alert, providers) {
   updateAlert(alert.id, { lastLowestPrice: lowest.price });
 
   if (alert.mode === 'smart' && decision.reason?.startsWith('not enough history') && shouldSendServiceMessage(alert, 'lastBaselineMessageAt')) {
-    await bot.telegram.sendMessage(alert.chatId, buildCurrentPriceMessage(alert, lowest, historyRows, weeklyTrend), {
+    await sendManagedMessage(bot, alert.chatId, buildCurrentPriceMessage(alert, lowest, historyRows, weeklyTrend), {
       disable_web_page_preview: true
     });
     updateAlert(alert.id, { lastBaselineMessageAt: new Date().toISOString(), lastLowestPrice: lowest.price });
@@ -391,18 +417,40 @@ async function checkAlert(bot, alert, providers) {
 
   if (!decision.ok) return;
 
+  const notifiedAt = new Date().toISOString();
   await sendAlertMessages(bot, alert, tickets, decision, errors);
-  updateAlert(alert.id, { lastNotifiedAt: new Date().toISOString(), lastLowestPrice: lowest.price });
+  const currentAlert = loadAlerts()[alert.id] || alert;
+  updateAlert(alert.id, {
+    lastNotifiedAt: notifiedAt,
+    lastLowestPrice: lowest.price,
+    lastNotifiedAtByDate: {
+      ...(currentAlert.lastNotifiedAtByDate || {}),
+      [alert.date]: notifiedAt
+    }
+  });
 }
 
 async function processAlerts(bot) {
   const alerts = Object.values(loadAlerts()).filter((alert) => alert.enabled);
   const providers = loadProviders();
   for (const alert of alerts) {
-    try {
-      await checkAlert(bot, alert, providers);
-    } catch (error) {
-      logger.error(`Alert ${alert.id}: ${error.message}`);
+    const dates = daysBetween(alert.date, alert.endDate || alert.date);
+    if (!dates.length) {
+      logger.warn(`Alert ${alert.id}: invalid date range ${alert.date}..${alert.endDate || alert.date}`);
+      continue;
+    }
+
+    for (const dateInfo of dates) {
+      try {
+        await checkAlert(bot, {
+          ...alert,
+          date: dateInfo.date,
+          jalaliDate: dateInfo.jalaliDate,
+          lastNotifiedAt: alert.lastNotifiedAtByDate?.[dateInfo.date] || alert.lastNotifiedAt
+        }, providers);
+      } catch (error) {
+        logger.error(`Alert ${alert.id} on ${dateInfo.date}: ${error.message}`);
+      }
     }
   }
 }

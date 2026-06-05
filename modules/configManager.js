@@ -44,7 +44,10 @@ function createAlert(chatId, input) {
     enabled: true,
     createdAt: new Date().toISOString(),
     lastNotifiedAt: null,
+    lastNotifiedAtByDate: {},
     lastLowestPrice: null,
+    endDate: input.endDate || input.date,
+    jalaliEndDate: input.jalaliEndDate || input.jalaliDate,
     ...input
   };
   saveAlerts(alerts);

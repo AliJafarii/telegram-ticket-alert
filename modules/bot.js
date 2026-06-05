@@ -9,6 +9,7 @@ const providers = require('../config/providers.json');
 
 const BOT_TOKEN = process.env.BOT_TOKEN;
 const states = new Map();
+const DELETE_MESSAGES_AFTER_SECONDS = Math.max(0, Number(process.env.DELETE_MESSAGES_AFTER_SECONDS || 300));
 
 const transports = {
   flight: 'هواپیما',
@@ -20,6 +21,34 @@ const mainMenu = Markup.keyboard([
   ['هشدار جدید'],
   ['هشدارهای من']
 ]).resize();
+
+function scheduleMessageDeletion(bot, chatId, messageId) {
+  if (!DELETE_MESSAGES_AFTER_SECONDS || !chatId || !messageId) return;
+  setTimeout(() => {
+    bot.telegram.deleteMessage(chatId, messageId).catch((error) => {
+      logger.warn('Could not delete message ' + messageId + ' in chat ' + chatId + ': ' + error.message);
+    });
+  }, DELETE_MESSAGES_AFTER_SECONDS * 1000);
+}
+
+function installAutoDelete(bot) {
+  bot.use(async (ctx, next) => {
+    if (!ctx.chat || !ctx.reply) return next();
+    const originalReply = ctx.reply.bind(ctx);
+    ctx.reply = async (...args) => {
+      const sent = await originalReply(...args);
+      if (sent?.message_id) scheduleMessageDeletion(bot, ctx.chat.id, sent.message_id);
+      return sent;
+    };
+    return next();
+  });
+}
+
+async function sendManagedMessage(bot, chatId, text, extra) {
+  const sent = await bot.telegram.sendMessage(chatId, text, extra);
+  if (sent?.message_id) scheduleMessageDeletion(bot, chatId, sent.message_id);
+  return sent;
+}
 
 const monthNames = [
   'فروردین',
@@ -46,11 +75,20 @@ function rows(buttons, size = 2) {
   return out;
 }
 
+function navRows() {
+  return [
+    [
+      Markup.button.callback('هشدار جدید', 'menu:new'),
+      Markup.button.callback('هشدارهای من', 'menu:alerts')
+    ]
+  ];
+}
+
 function keyboardFromMap(items, prefix) {
   const buttons = Object.entries(items).map(([label, code]) =>
     Markup.button.callback(label, prefix + ':' + code)
   );
-  return Markup.inlineKeyboard(rows(buttons, 2));
+  return Markup.inlineKeyboard([...rows(buttons, 2), ...navRows()]);
 }
 
 function transportKeyboard() {
@@ -59,7 +97,8 @@ function transportKeyboard() {
       Markup.button.callback('هواپیما', 'transport:flight'),
       Markup.button.callback('قطار', 'transport:train')
     ],
-    [Markup.button.callback('اتوبوس', 'transport:bus')]
+    [Markup.button.callback('اتوبوس', 'transport:bus')],
+    ...navRows()
   ]);
 }
 
@@ -80,14 +119,16 @@ function passengerKeyboard() {
       Markup.button.callback('۴ نفر', 'passengers:4'),
       Markup.button.callback('۵ نفر', 'passengers:5'),
       Markup.button.callback('۶ نفر', 'passengers:6')
-    ]
+    ],
+    ...navRows()
   ]);
 }
 
 function modeKeyboard() {
   return Markup.inlineKeyboard([
     [Markup.button.callback('هوشمند با تاریخچه قیمت', 'mode:smart')],
-    [Markup.button.callback('زیر مبلغ مشخص', 'mode:threshold')]
+    [Markup.button.callback('زیر مبلغ مشخص', 'mode:threshold')],
+    ...navRows()
   ]);
 }
 
@@ -101,7 +142,8 @@ function thresholdKeyboard() {
       Markup.button.callback('۵ میلیون', 'threshold:5000000'),
       Markup.button.callback('۱۰ میلیون', 'threshold:10000000')
     ],
-    [Markup.button.callback('مبلغ دلخواه', 'threshold:custom')]
+    [Markup.button.callback('مبلغ دلخواه', 'threshold:custom')],
+    ...navRows()
   ]);
 }
 
@@ -117,7 +159,8 @@ function yearKeyboard() {
       Markup.button.callback(String(jy), 'date-year:' + jy),
       Markup.button.callback(String(jy + 1), 'date-year:' + (jy + 1)),
       Markup.button.callback(String(jy + 2), 'date-year:' + (jy + 2))
-    ]
+    ],
+    ...navRows()
   ]);
 }
 
@@ -125,7 +168,7 @@ function monthKeyboard() {
   const buttons = monthNames.map((name, index) =>
     Markup.button.callback(name, 'date-month:' + (index + 1))
   );
-  return Markup.inlineKeyboard(rows(buttons, 3));
+  return Markup.inlineKeyboard([...rows(buttons, 3), ...navRows()]);
 }
 
 function dayKeyboard(year, month) {
@@ -134,7 +177,7 @@ function dayKeyboard(year, month) {
   for (let day = 1; day <= count; day += 1) {
     buttons.push(Markup.button.callback(String(day), 'date-day:' + day));
   }
-  return Markup.inlineKeyboard(rows(buttons, 7));
+  return Markup.inlineKeyboard([...rows(buttons, 7), ...navRows()]);
 }
 
 function cityNameByCode(map, code) {
@@ -164,13 +207,16 @@ function toGregorianDateString(jy, jm, jd) {
 function buildSummary(alert) {
   const originName = alert.originName || cityNameByCode(origins, alert.origin);
   const destinationName = alert.destinationName || cityNameByCode(destinations, alert.destination);
+  const startDate = alert.jalaliDate || alert.date;
+  const endDate = alert.jalaliEndDate || alert.endDate || startDate;
+  const dateLine = startDate === endDate ? startDate : startDate + ' تا ' + endDate;
   const lines = [
     'هشدار ذخیره شد.',
     '',
     'شناسه: ' + alert.id,
     'نوع سفر: ' + transports[alert.transport],
     'مسیر: ' + originName + ' به ' + destinationName,
-    'تاریخ: ' + (alert.jalaliDate || alert.date),
+    'بازه سفر: ' + dateLine,
     'تعداد مسافر: ' + alert.passengers,
     'حالت: ' + (alert.mode === 'threshold' ? 'زیر مبلغ مشخص' : 'هوشمند بر اساس تاریخچه قیمت')
   ];
@@ -212,7 +258,7 @@ function listAlertsText(chatId) {
     return [
       (alert.enabled ? 'فعال' : 'غیرفعال') + ' | ' + alert.id,
       transports[alert.transport] + ' | ' + originName + ' به ' + destinationName,
-      'تاریخ: ' + (alert.jalaliDate || alert.date),
+      'بازه سفر: ' + ((alert.jalaliEndDate && alert.jalaliEndDate !== alert.jalaliDate) ? (alert.jalaliDate + ' تا ' + alert.jalaliEndDate) : (alert.jalaliDate || alert.date)),
       'حالت: ' + (alert.mode === 'threshold' ? 'زیر ' + formatPrice(alert.thresholdPrice) : 'هوشمند')
     ].join('\n');
   }).join('\n\n');
@@ -252,6 +298,7 @@ function createBot() {
   }
 
   const bot = new Telegraf(BOT_TOKEN);
+  installAutoDelete(bot);
 
   bot.start((ctx) => ctx.reply([
     'بات هشدار قیمت بلیط آماده است.',
@@ -264,6 +311,16 @@ function createBot() {
 
   bot.hears('هشدارهای من', sendAlertsList);
   bot.command('alerts', sendAlertsList);
+
+  bot.action('menu:new', async (ctx) => {
+    await ctx.answerCbQuery();
+    await startNewAlert(ctx);
+  });
+
+  bot.action('menu:alerts', async (ctx) => {
+    await ctx.answerCbQuery();
+    await sendAlertsList(ctx);
+  });
 
   bot.command('stopalert', async (ctx) => {
     const id = ctx.message.text.split(/\s+/)[1];
@@ -325,14 +382,15 @@ function createBot() {
 
   bot.action(/destination:(\w+)/, async (ctx) => {
     const code = ctx.match[1];
-    setStep(ctx.chat.id, { step: 'date-year', destination: code, destinationName: cityNameByCode(destinations, code) });
-    await ctx.reply('سال سفر را انتخاب کن:', yearKeyboard());
+    setStep(ctx.chat.id, { step: 'date-year', dateStep: 'start', destination: code, destinationName: cityNameByCode(destinations, code) });
+    await ctx.reply('سال شروع بازه سفر را انتخاب کن:', yearKeyboard());
     await ctx.answerCbQuery();
   });
 
   bot.action(/date-year:(\d+)/, async (ctx) => {
+    const state = getStep(ctx.chat.id) || {};
     setStep(ctx.chat.id, { step: 'date-month', jy: Number(ctx.match[1]) });
-    await ctx.reply('ماه سفر را انتخاب کن:', monthKeyboard());
+    await ctx.reply('ماه ' + (state.dateStep === 'end' ? 'پایان' : 'شروع') + ' بازه سفر را انتخاب کن:', monthKeyboard());
     await ctx.answerCbQuery();
   });
 
@@ -341,7 +399,7 @@ function createBot() {
     if (!state?.jy) return ctx.answerCbQuery();
     const jm = Number(ctx.match[1]);
     setStep(ctx.chat.id, { step: 'date-day', jm });
-    await ctx.reply('روز سفر را انتخاب کن:', dayKeyboard(state.jy, jm));
+    await ctx.reply('روز ' + (state.dateStep === 'end' ? 'پایان' : 'شروع') + ' بازه سفر را انتخاب کن:', dayKeyboard(state.jy, jm));
     await ctx.answerCbQuery();
   });
 
@@ -351,8 +409,19 @@ function createBot() {
     const jd = Number(ctx.match[1]);
     const date = toGregorianDateString(state.jy, state.jm, jd);
     const jalaliDate = state.jy + '/' + String(state.jm).padStart(2, '0') + '/' + String(jd).padStart(2, '0');
-    setStep(ctx.chat.id, { step: 'passengers', jd, date, jalaliDate });
-    await ctx.reply('تعداد مسافر را انتخاب کن:', passengerKeyboard());
+    if (state.dateStep === 'end') {
+      if (state.date && date < state.date) {
+        await ctx.reply('تاریخ پایان نمی‌تواند قبل از تاریخ شروع باشد. سال پایان را دوباره انتخاب کن:', yearKeyboard());
+        await ctx.answerCbQuery();
+        return;
+      }
+      setStep(ctx.chat.id, { step: 'passengers', endJd: jd, endDate: date, jalaliEndDate: jalaliDate });
+      await ctx.reply('تعداد مسافر را انتخاب کن:', passengerKeyboard());
+      await ctx.answerCbQuery();
+      return;
+    }
+    setStep(ctx.chat.id, { step: 'date-year', dateStep: 'end', jd, date, jalaliDate });
+    await ctx.reply('سال پایان بازه سفر را انتخاب کن:', yearKeyboard());
     await ctx.answerCbQuery();
   });
 
@@ -418,4 +487,4 @@ function startBot() {
   return bot;
 }
 
-module.exports = { createBot, startBot };
+module.exports = { createBot, startBot, sendManagedMessage };
